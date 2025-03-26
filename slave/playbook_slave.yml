@@ -1,0 +1,189 @@
+---
+- name: Deploy MySQL Slave service
+  hosts: all
+  become: yes
+  vars:
+    mysql_slave_dir: "/mysql_slave"
+    mysql_slave_port: 3307
+    mysql_master_port: 3306
+    replica_user: "replica"
+    replica_password: "PfrjyjlfntkmPfrjyReplica"
+    mysql_master_root_password: "PfrjyjlfntkmPfrjy"
+    mysql_slave_service: "mysql-slave"
+    master_host: "127.0.0.1"
+
+  tasks:
+    # Установка MySQL Server
+    - name: Install MySQL Server (Debian)
+      apt:
+        name: mysql-server
+        state: present
+        update_cache: yes
+      when: ansible_os_family == 'Debian'
+
+    - name: Install MySQL Server (RHEL)
+      yum:
+        name: mysql-community-server
+        state: present
+      when: ansible_os_family == 'RedHat'
+
+    # Настройка MySQL Slave
+    - name: Create MySQL Slave directory
+      file:
+        path: "{{ mysql_slave_dir }}"
+        state: directory
+        owner: mysql
+        group: mysql
+        mode: '0750'
+
+    - name: Create MySQL subdirectory for datadir
+      file:
+        path: "{{ mysql_slave_dir }}/mysql"
+        state: directory
+        owner: mysql
+        group: mysql
+        mode: '0750'
+
+    - name: Create MySQL Slave config file
+      template:
+        src: mysql-slave.cnf.j2
+        dest: "{{ mysql_slave_dir }}/mysql-slave.cnf"
+        owner: mysql
+        group: mysql
+        mode: '0640'
+      register: conf_created
+      changed_when: conf_created.changed
+
+    - name: Verify MySQL Slave config file exists
+      stat:
+        path: "{{ mysql_slave_dir }}/mysql-slave.cnf"
+      register: mysql_slave_conf
+
+    - name: Fail if config file not created
+      fail:
+        msg: "Mysql Slave config file was not created"
+      when: not mysql_slave_conf.stat.exists
+
+    - name: Create systemd service file
+      template:
+        src: mysql-slave.service.j2
+        dest: "/etc/systemd/system/{{ mysql_slave_service }}.service"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Initialize MySQL Slave database
+      command: "mysqld --defaults-file={{ mysql_slave_dir }}/mysql-slave.cnf --initialize-insecure --user=mysql --datadir={{ mysql_slave_dir }}/mysql"
+      args:
+        creates: "{{ mysql_slave_dir }}/mysql/mysql"
+      when: mysql_slave_conf.stat.exists
+
+    - name: Start MySQL Slave service
+      systemd:
+        name: "{{ mysql_slave_service }}"
+        state: started
+        enabled: yes
+
+    - name: Wait for MySQL Slave to start
+      wait_for:
+        port: "{{ mysql_slave_port }}"
+        delay: 5
+        timeout: 60
+
+    # Проверка подключения без пароля
+    - name: Verify MySQL Slave root access
+      command: >
+        mysql -h 127.0.0.1 -P {{ mysql_slave_port }} -u root -e "SELECT 1"
+      register: mysql_access_check
+      ignore_errors: yes
+      changed_when: false
+
+    # Настройка репликации
+    - name: Wait for MySQL Master to be available
+      command: >
+        mysqladmin ping -h {{ master_host }} -P {{ mysql_master_port }} -u root -p{{ mysql_master_root_password }}
+      register: result
+      until: result.rc == 0
+      retries: 10
+      delay: 5
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Get master status from MySQL master
+      command: >
+        mysql -h {{ master_host }} -P {{ mysql_master_port }} -u root -p{{ mysql_master_root_password }}
+        -e "SHOW MASTER STATUS\G"
+      register: master_status
+      changed_when: false
+
+    - name: Extract master log file and position
+      set_fact:
+        master_log_file: "{{ master_status.stdout | regex_search('File:\\s+(.*)', '\\1') | first | trim }}"
+        master_log_pos: "{{ master_status.stdout | regex_search('Position:\\s+(.*)', '\\1') | first | trim }}"
+      when: master_status.stdout != ""
+
+    - name: Debug master status
+      debug:
+        msg: "Master log file: {{ master_log_file }}, Position: {{ master_log_pos }}"
+      when: master_log_file is defined and master_log_pos is defined
+
+    - name: Configure replication on slave
+      block:
+        - name: Stop replica if running
+          command: >
+            mysql -h 127.0.0.1 -P {{ mysql_slave_port }} -u root -e
+            "STOP REPLICA;"
+          ignore_errors: yes
+          changed_when: false
+          when: mysql_access_check.rc == 0
+
+        - name: Configure replication parameters
+          command: >
+            mysql -h 127.0.0.1 -P {{ mysql_slave_port }} -u root -e "
+            CHANGE REPLICATION SOURCE TO
+            SOURCE_HOST='{{ master_host }}',
+            SOURCE_PORT={{ mysql_master_port }},
+            SOURCE_USER='{{ replica_user }}',
+            SOURCE_PASSWORD='{{ replica_password }}',
+            SOURCE_LOG_FILE='{{ master_log_file }}',
+            SOURCE_LOG_POS={{ master_log_pos }};"
+          when: 
+            - mysql_access_check.rc == 0
+            - master_log_file is defined
+            - master_log_pos is defined
+
+        - name: Start replica
+          command: >
+            mysql -h 127.0.0.1 -P {{ mysql_slave_port }} -u root -e
+            "START REPLICA;"
+          when: mysql_access_check.rc == 0
+
+      when:
+        - master_log_file is defined
+        - master_log_pos is defined
+
+    - name: Verify replication status
+      block:
+        - name: Check replica status
+          shell: >
+            mysql -h 127.0.0.1 -P {{ mysql_slave_port }} -u root
+            -e "SHOW REPLICA STATUS\G" | grep -E 'Replica_IO_Running|Replica_SQL_Running'
+          register: replica_status
+          changed_when: false
+          ignore_errors: yes
+          when: mysql_access_check.rc == 0
+
+        - name: Display replication status
+          debug:
+            msg: |
+              Replication status:
+              {% if replica_status is defined %}
+                {{ replica_status.stdout_lines }}
+              {% else %}
+                Failed to check replication status
+              {% endif %}
+              MySQL access check: {{ mysql_access_check }}

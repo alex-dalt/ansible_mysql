@@ -1,0 +1,133 @@
+---
+- name: Установка и настройка MySQL 8.0
+  hosts: mysql_hosts
+  become: yes
+  tasks:
+    - name: Убедиться, что Python установлен
+      raw: test -e /usr/bin/python3 || (apt-get update && apt-get install -y python3)
+      args:
+        executable: /bin/bash
+      become: yes
+
+    - name: Установка MySQL 8.0
+      apt:
+        name: mysql-server-8.0
+        state: present
+        update_cache: yes
+
+    - name: Добавить пользователя adav в группу mysql
+      user:
+        name: adav
+        groups: mysql
+        append: yes
+      become: yes
+
+    - name: Остановка MySQL
+      service:
+        name: mysql
+        state: stopped
+
+    - name: Удалить каталог /mysql_master, если он существует
+      file:
+        path: /mysql_master
+        state: absent
+      ignore_errors: yes
+
+    - name: Проверить, что каталог /mysql_master удален
+      stat:
+        path: /mysql_master
+      register: mysql_dir
+
+    - name: Вывести результат проверки каталога
+      debug:
+        msg: "Каталог /mysql_master существует: {{ mysql_dir.stat.exists }}"
+
+    - name: Создание каталога /mysql_master
+      file:
+        path: /mysql_master
+        state: directory
+        owner: mysql
+        group: mysql
+        mode: '0750'
+      when: not mysql_dir.stat.exists
+
+    - name: Проверить, существует ли файл /etc/apparmor.d/usr.sbin.mysqld
+      stat:
+        path: /etc/apparmor.d/usr.sbin.mysqld
+      register: apparmor_file
+
+    - name: Добавить правила MySQL master в конфигурацию AppArmor
+      blockinfile:
+        path: /etc/apparmor.d/usr.sbin.mysqld
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - MySQL master rules"
+        block: |
+          /mysql_master/mysql-master.pid rw,
+          /mysql_master/mysql-master.sock rw,
+          /mysql_master/ r,
+          /mysql_master/** rwk,
+        insertafter: '^  /run/mysqld/mysqld.sock rw,$'
+      when: apparmor_file.stat.exists
+
+    - name: Перезагрузить AppArmor
+      service:
+        name: apparmor
+        state: reloaded
+      become: yes
+
+    - name: Очистка конфига /etc/mysql/mysql.conf.d/mysqld.cnf
+      copy:
+        dest: /etc/mysql/mysql.conf.d/mysqld.cnf
+        content: |
+          [mysqld]
+          user                        = mysql
+          server-id                   = 1
+          bind-address                = 127.0.0.1
+          port                        = 3306
+          socket                      = /mysql_master/mysql-master.sock
+          pid-file                    = /mysql_master/mysql-master.pid
+          datadir=/mysql_master
+          log_error                   = /mysql_master/error-master.log
+          log_bin                     = ON   
+          log_bin                     = /mysql_master/mysql-bin.log
+          binlog_expire_logs_seconds  = 604800
+          sync_binlog                 = 1
+          max_binlog_size             = 100M 
+          binlog-format               = ROW  
+          general_log_file            = /mysql_master/query.log
+          general_log                 = 0    
+          #lower_case_table_names     = 1 
+
+    - name: Инициализация MySQL
+      command: >
+        mysqld --initialize --user=mysql --datadir=/mysql_master
+      register: mysql_init
+      when: not mysql_dir.stat.exists
+
+    - name: Получение временного пароля
+      shell: |
+        sudo grep 'temporary password' /mysql_master/error-master.log | awk '{print $NF}'
+      register: temp_password
+      when: not mysql_dir.stat.exists
+
+    - name: Перезапуск системных служб
+      ansible.builtin.command: systemctl daemon-reload    
+
+    - name: Запуск MySQL
+      service:
+        name: mysql
+        state: started
+
+    - name: Смена пароля root
+      shell: |
+        mysql -u root -p'{{ temp_password.stdout }}' -h 127.0.0.1 -P 3306 --connect-expired-password -e "ALTER USER 'root'@'localhost' IDENTIFIED BY 'PfrjyjlfntkmPfrjy';"
+      when: not mysql_dir.stat.exists
+
+    - name: Создание пользователя для репликации
+      shell: |
+        mysql -u root -pPfrjyjlfntkmPfrjy -h 127.0.0.1 -P 3306 -e "CREATE USER 'replica'@'%' IDENTIFIED WITH mysql_native_password BY 'PfrjyjlfntkmPfrjyReplica'; GRANT REPLICATION SLAVE ON *.* TO 'replica'@'%'; FLUSH PRIVILEGES;"
+      when: not mysql_dir.stat.exists
+
+    - name: Включение автозапуска MySQL
+      service:
+        name: mysql
+        enabled: yes

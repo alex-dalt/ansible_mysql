@@ -1,0 +1,15 @@
+[Unit]
+Description=MySQL Slave Service
+After=network.target
+
+[Service]
+Type=forking
+User=mysql
+Group=mysql
+ExecStart=/usr/sbin/mysqld --defaults-file={{ mysql_slave_dir }}/mysql-slave.cnf --daemonize --pid-file={{ mysql_slave_dir }}/mysql/mysql-slave.pid
+PIDFile={{ mysql_slave_dir }}/mysql/mysql-slave.pid
+Restart=on-failure
+LimitNOFILE=5000
+
+[Install]
+WantedBy=multi-user.target
