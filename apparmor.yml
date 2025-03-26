@@ -1,0 +1,21 @@
+---
+- name: Configure AppArmor for MySQL
+  hosts: all
+  become: yes
+  tasks:
+    - name: Check if the file /etc/apparmor.d/usr.sbin.mysqld exists
+      stat:
+        path: /etc/apparmor.d/usr.sbin.mysqld
+      register: apparmor_file
+
+    - name: Add MySQL master rules to AppArmor configuration
+      blockinfile:
+        path: /etc/apparmor.d/usr.sbin.mysqld
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - MySQL master rules"
+        block: |
+            /mysql_master/mysql-master.pid rw,
+            /mysql_master/mysql-master.sock rw,
+            /mysql_master/ r,
+            /mysql_master/** rwk,
+        insertafter: '^  /run/mysqld/mysqld.sock rw,$'
+      when: apparmor_file.stat.exists
