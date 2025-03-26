@@ -1,0 +1,23 @@
+[mysqld]
+datadir = {{ mysql_slave_dir }}/mysql
+socket = {{ mysql_slave_dir }}/mysql-slave.sock
+log-error = {{ mysql_slave_dir }}/error-slave.log
+pid-file = {{ mysql_slave_dir }}/mysql/mysql-slave.pid
+port = {{ mysql_slave_port }}  # Уникальный порт для Slave
+
+# Настройки репликации (Slave)
+server-id = 2
+relay-log = {{ mysql_slave_dir }}/mysql-relay-bin
+log_bin = {{ mysql_slave_dir }}/mysql-bin.log
+binlog_format = ROW
+binlog_expire_logs_seconds = 604800  # 7 дней
+sync_binlog = 1
+
+# Современные настройки для MySQL 8.x
+#authentication_policy = mysql_native_password,caching_sha2_password
+
+# Отключение X Plugin
+mysqlx = 0
+
+# Отключение привязки к конкретному IP (для репликации)
+bind-address = 0.0.0.0
